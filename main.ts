@@ -3,20 +3,30 @@
  * ------------------------------------------------------------------
  * 功能：
  *  - 每个工作日（周一至周五）北京时间 09:00 自动运行
- *  - 查询两个来源（东方财富、集思录）当天是否有可转债新债申购
+ *  - 查询两个来源（东方财富、同花顺）当天是否有可转债新债申购
+ *  - 每个来源：超时/失败后间隔 1 分钟重试，最多尝试 3 次
  *  - 两来源一致 → 推送一次；不一致 → 两个来源都推送；均无 → 推送“无新债”
+ *  - 两来源 3 次尝试后都失败 → 推送“无法查询”告警
  *  - 推送使用 PushDeer（自建源），并强制使用特定 User-Agent
  *  - 每步打印简单的过程与结果
  *
  * 用法：
- *  本地运行     ： deno task check
- *  部署 Deno Deploy： deno task deploy   （cron 会自动注册）
- *  本地定时     ： crontab 加  `0 9 * * 1-5 cd <目录> && deno task check >> log.txt`
+ *  本地运行        ： deno task check
+ *  部署 Deno Deploy： 推 GitHub 后自动部署，cron 自动注册；访问 /run 可手动触发一次
  * ------------------------------------------------------------------
  */
 import { loadConfig } from "./config.ts";
-import { fetchEastmoney, fetchJisilu, todayStr, Bond, SourceResult } from "./sources.ts";
+import {
+  fetchEastmoney,
+  fetchTonghuashun,
+  MAX_ATTEMPTS,
+  todayStr,
+} from "./sources.ts";
+import type { Bond, SourceResult } from "./sources.ts";
 import { pushDeer } from "./pushdeer.ts";
+
+const SOURCE_A = "东方财富";
+const SOURCE_B = "同花顺";
 
 function log(step: string, msg: string) {
   console.log(`[${step}] ${msg}`);
@@ -35,63 +45,85 @@ function formatBonds(bonds: Bond[], label: string): string {
 }
 
 export async function run() {
+  const startedAt = Date.now();
   const cfg = loadConfig();
   const today = todayStr();
-  log("1/5", `初始化：今天（北京时间）= ${today}`);
+  log("1/5", `初始化：今天（北京时间）= ${today}；重试策略 = 最多 ${MAX_ATTEMPTS} 次、间隔 60 秒`);
 
-  // 步骤2：来源A 东方财富
-  const ra: SourceResult = await fetchEastmoney(today, cfg.dataUserAgent);
-  log("2/5", ra.ok
-    ? `来源A 东方财富：查询到 ${ra.bonds.length} 只申购`
-    : `来源A 东方财富：查询失败 - ${ra.error}`);
+  // 步骤2：并行查询两个来源（各自内部带超时与重试，过程逐条打印）
+  log("2/5", "开始并行查询两个来源…");
+  const [ra, rb]: [SourceResult, SourceResult] = await Promise.all([
+    fetchEastmoney(today, cfg.dataUserAgent, (m) => log("2/5", m)),
+    fetchTonghuashun(today, cfg.dataUserAgent, (m) => log("2/5", m)),
+  ]);
 
-  // 步骤3：来源B 集思录
-  const rb: SourceResult = await fetchJisilu(today, cfg.dataUserAgent, cfg.jisiluCookie);
-  log("3/5", rb.ok
-    ? `来源B 集思录：查询到 ${rb.bonds.length} 只申购`
-    : `来源B 集思录：查询失败 - ${rb.error}`);
+  // 步骤3：汇总
+  const descA = ra.ok
+    ? `${ra.bonds.length} 只${ra.bonds.length ? "（" + ra.bonds.map((b) => `${b.name}/${b.code}`).join("、") + "）" : ""}`
+    : `查询失败（尝试 ${ra.attempts} 次）- ${ra.error}`;
+  const descB = rb.ok
+    ? `${rb.bonds.length} 只${rb.bonds.length ? "（" + rb.bonds.map((b) => `${b.name}/${b.code}`).join("、") + "）" : ""}`
+    : `查询失败（尝试 ${rb.attempts} 次）- ${rb.error}`;
+  log("3/5", `汇总：来源A ${SOURCE_A} → ${descA}`);
+  log("3/5", `汇总：来源B ${SOURCE_B} → ${descB}`);
 
-  // 步骤4：比对两来源
+  // 步骤4：比对
   const codesA = new Set(ra.bonds.map((b) => b.code));
   const codesB = new Set(rb.bonds.map((b) => b.code));
+  const bothFailed = !ra.ok && !rb.ok;
   const bothOk = ra.ok && rb.ok;
   const consistent = bothOk && setsEqual(codesA, codesB);
-  log("4/5", consistent
-    ? "比对：两来源一致"
-    : `比对：两来源不一致（A=${ra.bonds.length}, B=${rb.bonds.length}）`);
 
-  // 组装推送内容
   let title: string;
   let content: string;
-  if (ra.bonds.length === 0 && rb.bonds.length === 0) {
-    // 两来源都无 → 推送“当天无新债”
-    title = `可转债新债提醒 ${today}`;
-    content = `今天（${today}）中国市场**无**可转债新债申购申请。`;
+
+  if (bothFailed) {
+    // 两来源都失败 → 推送“无法查询”告警
+    log("4/5", `比对：跳过（两来源均在 ${MAX_ATTEMPTS} 次尝试后失败）`);
+    title = `⚠️ 可转债新债查询失败 ${today}`;
+    content = `今天（${today}）两个数据源均**无法查询**，已各重试 ${MAX_ATTEMPTS} 次（间隔 60 秒）。\n\n` +
+      `- 来源A ${SOURCE_A}：${ra.error}\n` +
+      `- 来源B ${SOURCE_B}：${rb.error}\n\n` +
+      `请手动确认今日是否有新债申购。`;
   } else if (consistent) {
-    // 一致 → 推送一次
-    const merged = ra.bonds;
-    title = `可转债新债提醒 ${today}（${merged.length} 只）`;
-    content = `今天（${today}）有可转债新债申购，两来源一致：\n\n` +
-      formatBonds(merged, "新债");
+    log("4/5", "比对：两来源一致");
+    if (ra.bonds.length === 0) {
+      // 一致且都为 0 → 当天无新债
+      title = `可转债新债提醒 ${today}`;
+      content = `今天（${today}）中国市场**无**可转债新债申购申请。\n\n（${SOURCE_A} 与 ${SOURCE_B} 两来源结果一致）`;
+    } else {
+      // 一致且有债 → 推送一次
+      title = `可转债新债提醒 ${today}（${ra.bonds.length} 只）`;
+      content = `今天（${today}）有可转债新债申购，两来源一致：\n\n` +
+        formatBonds(ra.bonds, "新债") +
+        `\n\n（来源：${SOURCE_A} / ${SOURCE_B}）`;
+    }
   } else {
-    // 不一致（含某来源查询失败）→ 两个来源都推送
+    // 不一致（含其中一个来源查询失败）→ 两个来源都推送
+    log("4/5", `比对：两来源不一致（A=${ra.ok ? ra.bonds.length + " 只" : "失败"}, B=${rb.ok ? rb.bonds.length + " 只" : "失败"}）`);
     const aNote = ra.ok
-      ? formatBonds(ra.bonds, "来源A 东方财富")
-      : `来源A 东方财富：查询失败（${ra.error}）`;
+      ? formatBonds(ra.bonds, `来源A ${SOURCE_A}`)
+      : `来源A ${SOURCE_A}：查询失败（已重试 ${ra.attempts} 次）- ${ra.error}`;
     const bNote = rb.ok
-      ? formatBonds(rb.bonds, "来源B 集思录")
-      : `来源B 集思录：查询失败（${rb.error}）`;
+      ? formatBonds(rb.bonds, `来源B ${SOURCE_B}`)
+      : `来源B ${SOURCE_B}：查询失败（已重试 ${rb.attempts} 次）- ${rb.error}`;
     title = `可转债新债提醒 ${today}【来源不一致】`;
-    content = `两来源结果不一致，分别列出：\n\n${aNote}\n\n${bNote}`;
+    content = `今天（${today}）两来源结果不一致，分别列出：\n\n${aNote}\n\n${bNote}`;
   }
 
   // 步骤5：推送
   if (!cfg.pushdeerKey) {
     log("5/5", `未配置 PUSHDEER_KEY，仅打印不推送。\n标题：${title}\n${content}`);
+    log("5/5", `全流程结束，总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
     return;
   }
-  const r = await pushDeer(cfg, title, content);
-  log("5/5", `推送 PushDeer：HTTP ${r.status} ${r.ok ? "成功" : "失败"} ${r.text.slice(0, 100)}`);
+  try {
+    const r = await pushDeer(cfg, title, content);
+    log("5/5", `推送 PushDeer：HTTP ${r.status} ${r.ok ? "成功" : "失败"} ${r.text.slice(0, 120)}`);
+  } catch (e) {
+    log("5/5", `推送 PushDeer 异常：${(e as Error).message}`);
+  }
+  log("5/5", `全流程结束，总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
 }
 
 // ---- 调度 ----
@@ -107,14 +139,14 @@ if (isDeployed) {
     const path = new URL(req.url).pathname;
     if (path === "/favicon.ico") return new Response(null, { status: 204 });
     if (path === "/run") {
-      // 后台执行，避免请求超时；结果去 Logs 看
+      // 后台执行，避免请求超时（最坏情况含重试要几分钟）；结果去 Logs 看
       run().catch((e) => console.error("手动触发失败：", e));
       return new Response("triggered, check deploy logs", {
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
     }
     return new Response(
-      "kezhai-reminder is running.\ncron: 0 9 * * 1-5 (Asia/Shanghai)\nmanual trigger: GET /run\n",
+      "kezhai-reminder is running.\ncron: 0 9 * * 1-5 (Asia/Shanghai)\nsources: eastmoney + 10jqka\nmanual trigger: GET /run\n",
       { headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   });

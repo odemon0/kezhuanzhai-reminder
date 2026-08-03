@@ -1,10 +1,12 @@
-import { Config } from "./config.ts";
+import type { Config } from "./config.ts";
 
 export interface PushResult {
   ok: boolean;
   status: number;
   text: string;
 }
+
+const PUSH_TIMEOUT_MS = 15_000;
 
 // 通过 PushDeer 自建源推送；★ 强制使用配置中的特定 User-Agent
 export async function pushDeer(
@@ -23,6 +25,7 @@ export async function pushDeer(
     headers: {
       "User-Agent": cfg.pushdeerUserAgent, // ★ 用户指定的 UA
     },
+    signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
   });
   const text = await res.text();
   return { ok: res.ok, status: res.status, text };
