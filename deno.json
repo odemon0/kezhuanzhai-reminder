@@ -1,0 +1,7 @@
+{
+  "tasks": {
+    "check": "deno run --allow-net --allow-env main.ts",
+    "deploy": "deployctl deploy --project=kezhai-reminder --prod main.ts"
+  },
+  "imports": {}
+}
