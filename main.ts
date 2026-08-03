@@ -3,6 +3,7 @@
  * ------------------------------------------------------------------
  * 功能：
  *  - 每个工作日（周一至周五）北京时间 09:00 自动运行
+ *    （cron 表达式写作 UTC 的 "0 1 * * 2-6"，详见文件末尾调度处的注释）
  *  - 查询两个来源（东方财富、同花顺）当天是否有可转债新债申购
  *  - 每个来源：超时/失败后间隔 1 分钟重试，最多尝试 3 次
  *  - 两来源一致 → 推送一次；不一致 → 两个来源都推送；均无 → 推送“无新债”
@@ -28,6 +29,20 @@ import { normalizePushUrl, pushDeer } from "./pushdeer.ts";
 const SOURCE_A = "东方财富";
 const SOURCE_B = "同花顺";
 
+/**
+ * cron 表达式（UTC）。Deno.cron 不支持 timezone，时间一律按 UTC 解释。
+ *  - 北京时间 09:00 = UTC 01:00（UTC+8，中国不实行夏令时，全年固定）
+ *  - Deno 的星期约定是 1-7 = SUN-SAT，所以「周一至周五」= 2-6
+ * 即：UTC 周一~周五 01:00 → 北京时间 周一~周五 09:00
+ */
+export const CRON_EXPR = "0 1 * * 2-6";
+export const CRON_DESC = `${CRON_EXPR} (UTC) = 每周一至周五 09:00 北京时间`;
+
+/** 当前北京时间，形如 2026-08-03 17:07:13 */
+function beijingNow(): string {
+  return new Date().toLocaleString("sv-SE", { timeZone: "Asia/Shanghai" });
+}
+
 function log(step: string, msg: string) {
   console.log(`[${step}] ${msg}`);
 }
@@ -48,7 +63,8 @@ export async function run() {
   const startedAt = Date.now();
   const cfg = loadConfig();
   const today = todayStr();
-  log("1/5", `初始化：今天（北京时间）= ${today}；重试策略 = 最多 ${MAX_ATTEMPTS} 次、间隔 60 秒`);
+  log("1/5", `初始化：北京时间 ${beijingNow()}（UTC ${new Date().toISOString().slice(0, 19).replace("T", " ")}）`);
+  log("1/5", `查询日期（北京时间）= ${today}；重试策略 = 最多 ${MAX_ATTEMPTS} 次、间隔 60 秒`);
   log(
     "1/5",
     `推送配置：接口 = ${normalizePushUrl(cfg.pushdeerUrl)}；pushkey = ${
@@ -140,9 +156,15 @@ export async function run() {
 // 部署到 Deno Deploy 时注册 cron；本地直接运行一次
 const isDeployed = !!Deno.env.get("DENO_DEPLOYMENT_ID");
 if (isDeployed) {
-  // 注意：Deno.cron 的任务名只允许「字母、数字、空格、连字符、下划线」，不能用中文
-  // 每周一至周五 09:00（北京时间）自动运行
-  Deno.cron("cb-new-bond-reminder", "0 9 * * 1-5", { timezone: "Asia/Shanghai" }, run);
+  // ⚠️ Deno.cron 的两个官方约定，踩过坑记下来：
+  //  1) 任务名只允许「字母、数字、空格、连字符、下划线」，不能用中文。
+  //  2) schedule 只能用 UTC，options 里【没有】timezone 选项（只有 backoffSchedule / signal），
+  //     写了会被静默忽略。所以北京时间 09:00 必须自己换算成 UTC 01:00（UTC+8）。
+  //  3) 星期字段用 1-7 = SUN-SAT（不是常见的 0-6！），因此周一至周五 = 2-6。
+  //     —— 若写成 1-5，实际是「周日到周四」。
+  //
+  //  结果：UTC 每周一至周五 01:00  ==  北京时间每周一至周五 09:00
+  Deno.cron("cb-new-bond-reminder", CRON_EXPR, run);
 
   // 部署后访问 /run 可手动触发一次检查（方便不本地跑也能验证 PushDeer 配置）
   Deno.serve(async (req) => {
@@ -183,7 +205,8 @@ if (isDeployed) {
     }
     return new Response(
       "kezhai-reminder is running.\n" +
-        "cron: 0 9 * * 1-5 (Asia/Shanghai)\n" +
+        `cron  : ${CRON_DESC}\n` +
+        `now   : 北京时间 ${beijingNow()}\n` +
         "sources: eastmoney + 10jqka\n" +
         "manual trigger  : GET /run        (完整流程，结果看 Logs)\n" +
         "pushdeer test   : GET /push-test  (只测推送，结果直接返回)\n",
@@ -191,7 +214,7 @@ if (isDeployed) {
     );
   });
 
-  console.log("已注册 cron：cb-new-bond-reminder，每周一至周五 09:00（北京时间）。访问 /run 可手动触发一次。");
+  console.log(`已注册 cron：cb-new-bond-reminder，${CRON_DESC}。当前北京时间 ${beijingNow()}。访问 /run 可手动触发一次。`);
 } else {
   await run();
 }
