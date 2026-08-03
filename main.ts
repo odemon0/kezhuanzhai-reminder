@@ -23,7 +23,7 @@ import {
   todayStr,
 } from "./sources.ts";
 import type { Bond, SourceResult } from "./sources.ts";
-import { pushDeer } from "./pushdeer.ts";
+import { normalizePushUrl, pushDeer } from "./pushdeer.ts";
 
 const SOURCE_A = "东方财富";
 const SOURCE_B = "同花顺";
@@ -49,6 +49,12 @@ export async function run() {
   const cfg = loadConfig();
   const today = todayStr();
   log("1/5", `初始化：今天（北京时间）= ${today}；重试策略 = 最多 ${MAX_ATTEMPTS} 次、间隔 60 秒`);
+  log(
+    "1/5",
+    `推送配置：接口 = ${normalizePushUrl(cfg.pushdeerUrl)}；pushkey = ${
+      cfg.pushdeerKey ? cfg.pushdeerKey.slice(0, 4) + "***(len " + cfg.pushdeerKey.length + ")" : "未配置"
+    }`,
+  );
 
   // 步骤2：并行查询两个来源（各自内部带超时与重试，过程逐条打印）
   log("2/5", "开始并行查询两个来源…");
@@ -118,8 +124,12 @@ export async function run() {
     return;
   }
   try {
-    const r = await pushDeer(cfg, title, content);
-    log("5/5", `推送 PushDeer：HTTP ${r.status} ${r.ok ? "成功" : "失败"} ${r.text.slice(0, 120)}`);
+    const r = await pushDeer(cfg, title, content, (m) => log("5/5", m));
+    log(
+      "5/5",
+      `推送 PushDeer：${r.ok ? "✅ 成功" : "❌ 失败"}（HTTP ${r.status}，接口 ${r.url}）— ${r.reason}`,
+    );
+    if (!r.ok) log("5/5", `原始返回：${r.text}`);
   } catch (e) {
     log("5/5", `推送 PushDeer 异常：${(e as Error).message}`);
   }
@@ -135,9 +145,35 @@ if (isDeployed) {
   Deno.cron("cb-new-bond-reminder", "0 9 * * 1-5", { timezone: "Asia/Shanghai" }, run);
 
   // 部署后访问 /run 可手动触发一次检查（方便不本地跑也能验证 PushDeer 配置）
-  Deno.serve((req) => {
+  Deno.serve(async (req) => {
     const path = new URL(req.url).pathname;
     if (path === "/favicon.ico") return new Response(null, { status: 204 });
+
+    // 单独测试 PushDeer 是否真的能推送（结果直接在浏览器里显示，不用翻 Logs）
+    if (path === "/push-test") {
+      const cfg = loadConfig();
+      const endpoint = normalizePushUrl(cfg.pushdeerUrl);
+      if (!cfg.pushdeerKey) {
+        return new Response(`❌ 未配置 PUSHDEER_KEY\n接口地址：${endpoint}\n`, {
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+      const r = await pushDeer(
+        cfg,
+        "PushDeer 连通性测试",
+        `这是一条来自 kezhai-reminder 的测试消息。\n\n时间：${new Date().toISOString()}`,
+        (m) => console.log(`[push-test] ${m}`),
+      );
+      return new Response(
+        `${r.ok ? "✅ 推送成功" : "❌ 推送失败"}\n` +
+          `接口地址：${r.url}\n` +
+          `HTTP 状态：${r.status}\n` +
+          `判定原因：${r.reason}\n` +
+          `原始返回：${r.text}\n`,
+        { headers: { "content-type": "text/plain; charset=utf-8" } },
+      );
+    }
+
     if (path === "/run") {
       // 后台执行，避免请求超时（最坏情况含重试要几分钟）；结果去 Logs 看
       run().catch((e) => console.error("手动触发失败：", e));
@@ -146,7 +182,11 @@ if (isDeployed) {
       });
     }
     return new Response(
-      "kezhai-reminder is running.\ncron: 0 9 * * 1-5 (Asia/Shanghai)\nsources: eastmoney + 10jqka\nmanual trigger: GET /run\n",
+      "kezhai-reminder is running.\n" +
+        "cron: 0 9 * * 1-5 (Asia/Shanghai)\n" +
+        "sources: eastmoney + 10jqka\n" +
+        "manual trigger  : GET /run        (完整流程，结果看 Logs)\n" +
+        "pushdeer test   : GET /push-test  (只测推送，结果直接返回)\n",
       { headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   });
