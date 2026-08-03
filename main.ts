@@ -98,14 +98,28 @@ export async function run() {
 // 部署到 Deno Deploy 时注册 cron；本地直接运行一次
 const isDeployed = !!Deno.env.get("DENO_DEPLOYMENT_ID");
 if (isDeployed) {
+  // 注意：Deno.cron 的任务名只允许「字母、数字、空格、连字符、下划线」，不能用中文
   // 每周一至周五 09:00（北京时间）自动运行
-  Deno.cron("可转债新债提醒", "0 9 * * 1-5", { timezone: "Asia/Shanghai" }, run);
-  // 部署后访问项目 URL 可手动触发一次检查（方便不本地跑也能验证 PushDeer 配置）
-  Deno.serve(async (_req) => {
-    await run();
-    return new Response("check done, see deploy logs");
+  Deno.cron("cb-new-bond-reminder", "0 9 * * 1-5", { timezone: "Asia/Shanghai" }, run);
+
+  // 部署后访问 /run 可手动触发一次检查（方便不本地跑也能验证 PushDeer 配置）
+  Deno.serve((req) => {
+    const path = new URL(req.url).pathname;
+    if (path === "/favicon.ico") return new Response(null, { status: 204 });
+    if (path === "/run") {
+      // 后台执行，避免请求超时；结果去 Logs 看
+      run().catch((e) => console.error("手动触发失败：", e));
+      return new Response("triggered, check deploy logs", {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+    return new Response(
+      "kezhai-reminder is running.\ncron: 0 9 * * 1-5 (Asia/Shanghai)\nmanual trigger: GET /run\n",
+      { headers: { "content-type": "text/plain; charset=utf-8" } },
+    );
   });
-  console.log("已注册 cron：每周一至周五 09:00（北京时间）。访问项目 URL 可手动触发一次。");
+
+  console.log("已注册 cron：cb-new-bond-reminder，每周一至周五 09:00（北京时间）。访问 /run 可手动触发一次。");
 } else {
   await run();
 }
