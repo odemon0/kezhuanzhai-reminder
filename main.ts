@@ -59,6 +59,27 @@ function formatBonds(bonds: Bond[], label: string): string {
   return `${label}（${bonds.length} 只）：\n` + lines.join("\n");
 }
 
+/** 标题里用的短日期，形如 08-05（年份在正文里，标题省下字数给关键信息） */
+function shortDate(d: string): string {
+  return d.slice(5);
+}
+
+/**
+ * 债券名列表，超过 max 只时截断成「A、B、C 等」，避免标题过长被系统截掉。
+ * 不带数量后缀——标题里前面已经写了「N 只」，重复显示会很啰嗦。
+ */
+function bondNames(bonds: Bond[], max = 3): string {
+  const names = bonds.map((b) => b.name);
+  if (names.length <= max) return names.join("、");
+  return names.slice(0, max).join("、") + " 等";
+}
+
+/** 单个来源的简述，用于「来源不一致」时的标题 */
+function briefOf(r: SourceResult): string {
+  if (!r.ok) return "查询失败";
+  return r.bonds.length === 0 ? "无" : `${r.bonds.length} 只`;
+}
+
 export async function run() {
   const startedAt = Date.now();
   const cfg = loadConfig();
@@ -102,7 +123,7 @@ export async function run() {
   if (bothFailed) {
     // 两来源都失败 → 推送“无法查询”告警
     log("4/5", `比对：跳过（两来源均在 ${MAX_ATTEMPTS} 次尝试后失败）`);
-    title = `⚠️ 可转债新债查询失败 ${today}`;
+    title = `❗ 今日新债查询失败 ${shortDate(today)}｜请手动确认`;
     content = `今天（${today}）两个数据源均**无法查询**，已各重试 ${MAX_ATTEMPTS} 次（间隔 60 秒）。\n\n` +
       `- 来源A ${SOURCE_A}：${ra.error}\n` +
       `- 来源B ${SOURCE_B}：${rb.error}\n\n` +
@@ -111,11 +132,11 @@ export async function run() {
     log("4/5", "比对：两来源一致");
     if (ra.bonds.length === 0) {
       // 一致且都为 0 → 当天无新债
-      title = `可转债新债提醒 ${today}`;
+      title = `⭕ 今日无新债 ${shortDate(today)}`;
       content = `今天（${today}）中国市场**无**可转债新债申购申请。\n\n（${SOURCE_A} 与 ${SOURCE_B} 两来源结果一致）`;
     } else {
       // 一致且有债 → 推送一次
-      title = `可转债新债提醒 ${today}（${ra.bonds.length} 只）`;
+      title = `🔔 今日有新债 ${ra.bonds.length} 只｜${bondNames(ra.bonds)}（${shortDate(today)}）`;
       content = `今天（${today}）有可转债新债申购，两来源一致：\n\n` +
         formatBonds(ra.bonds, "新债") +
         `\n\n（来源：${SOURCE_A} / ${SOURCE_B}）`;
@@ -129,7 +150,10 @@ export async function run() {
     const bNote = rb.ok
       ? formatBonds(rb.bonds, `来源B ${SOURCE_B}`)
       : `来源B ${SOURCE_B}：查询失败（已重试 ${rb.attempts} 次）- ${rb.error}`;
-    title = `可转债新债提醒 ${today}【来源不一致】`;
+    // 只要任一来源查到债，标题就按「可能有新债」提示，避免漏掉申购机会
+    const anyBond = ra.bonds.length > 0 || rb.bonds.length > 0;
+    title = `⚠️ 今日${anyBond ? "疑似有新债" : "疑似无新债"}·待核实 ${shortDate(today)}｜` +
+      `${SOURCE_A} ${briefOf(ra)} / ${SOURCE_B} ${briefOf(rb)}`;
     content = `今天（${today}）两来源结果不一致，分别列出：\n\n${aNote}\n\n${bNote}`;
   }
 
