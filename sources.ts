@@ -1,11 +1,23 @@
 // 两个数据源：东方财富（来源A）、同花顺（来源B）
-// 统一返回 { ok, bonds, error? } 结构，任一来源失败不影响另一来源
-// 每个来源自带「超时 + 失败后间隔 1 分钟重试，最多 3 次」的能力
+// 每个来源都支持两类查询：
+//   - apply   ：当天「新债申购」（申购日 = 今天）
+//   - listing ：当天「新债上市」（上市日 = 今天）
+// 统一返回 { ok, bonds, error? } 结构，任一来源/任一类别失败不影响其他
+// 每个查询自带「超时 + 失败后间隔 1 分钟重试，最多 3 次」的能力
+
+/** 查询类别：申购 / 上市 */
+export type QueryKind = "apply" | "listing";
+
+export const KIND_LABEL: Record<QueryKind, string> = {
+  apply: "申购",
+  listing: "上市",
+};
 
 export interface Bond {
   code: string;
   name: string;
-  applyDate: string;
+  /** 该债对应的日期：apply=申购日，listing=上市日 */
+  date: string;
 }
 
 export interface SourceResult {
@@ -55,7 +67,7 @@ async function fetchJson(
 /**
  * 通用重试包装：
  *  - 抛异常（超时/网络错误/HTTP 非 200/接口异常）→ 视为失败，等待 RETRY_DELAY_MS 后重试
- *  - 正常返回（哪怕是空数组，代表“今天确实没有新债”）→ 立即成功返回，不重试
+ *  - 正常返回（哪怕是空数组，代表“今天确实没有”）→ 立即成功返回，不重试
  */
 export async function withRetry(
   label: string,
@@ -93,21 +105,33 @@ export async function withRetry(
 // ==================== 来源A：东方财富 ====================
 // 实测要点：
 //  1. 分页参数是 pageNumber / pageSize（不是 page / page_size，写错会拿到过期数据！）
-//  2. 申购日期字段是 PUBLIC_START_DATE（没有 APPLY_DATE）
+//  2. 申购日期字段 = PUBLIC_START_DATE；上市日期字段 = LISTING_DATE（都没有 APPLY_DATE）
 //  3. 直接用 filter 精确查当天，一次请求搞定，不需要拉全量
 //  4. 当天无数据时返回 {"result":null,"success":false,"message":"返回数据为空","code":9201}
-//     —— 这是正常的“今天没有新债”，不能当作错误去重试
-async function eastmoneyOnce(today: string, ua: string): Promise<Bond[]> {
+//     —— 这是正常的“今天没有”，不能当作错误去重试
+//  5. ⚠️ 上市首日东财的简称会带 N 前缀（如 113708 显示为「N曙26转」，同花顺是「曙26转债」），
+//     所以两来源比对只能按【代码】比，不能按名称比。
+const EM_DATE_FIELD: Record<QueryKind, string> = {
+  apply: "PUBLIC_START_DATE",
+  listing: "LISTING_DATE",
+};
+
+async function eastmoneyOnce(
+  today: string,
+  ua: string,
+  kind: QueryKind,
+): Promise<Bond[]> {
+  const field = EM_DATE_FIELD[kind];
   const params = new URLSearchParams({
     reportName: "RPT_BOND_CB_LIST",
     columns: "ALL",
     source: "WEB",
     client: "WEB",
-    sortColumns: "PUBLIC_START_DATE",
+    sortColumns: field,
     sortTypes: "-1",
     pageNumber: "1",
     pageSize: "50",
-    filter: `(PUBLIC_START_DATE='${today}')`,
+    filter: `(${field}='${today}')`,
   });
   const url = `https://datacenter-web.eastmoney.com/api/data/v1/get?${params.toString()}`;
   const json = await fetchJson(url, {
@@ -126,11 +150,11 @@ async function eastmoneyOnce(today: string, ua: string): Promise<Bond[]> {
   const rows: Record<string, unknown>[] = json?.result?.data ?? [];
   const bonds: Bond[] = [];
   for (const r of rows) {
-    const applyDate = String(r.PUBLIC_START_DATE ?? "").slice(0, 10);
-    if (applyDate !== today) continue;
+    const date = String(r[field] ?? "").slice(0, 10);
+    if (date !== today) continue;
     const code = String(r.SECURITY_CODE ?? "").trim();
     const name = String(r.SECURITY_NAME_ABBR ?? r.SECURITY_NAME ?? "").trim();
-    if (code) bonds.push({ code, name, applyDate });
+    if (code) bonds.push({ code, name, date });
   }
   return bonds;
 }
@@ -138,39 +162,81 @@ async function eastmoneyOnce(today: string, ua: string): Promise<Bond[]> {
 export function fetchEastmoney(
   today: string,
   ua: string,
+  kind: QueryKind,
   onLog: (msg: string) => void,
 ): Promise<SourceResult> {
-  return withRetry("来源A 东方财富", () => eastmoneyOnce(today, ua), onLog);
+  return withRetry(
+    `来源A 东方财富·${KIND_LABEL[kind]}`,
+    () => eastmoneyOnce(today, ua, kind),
+    onLog,
+  );
 }
 
 // ==================== 来源B：同花顺 ====================
 // 接口：https://data.10jqka.com.cn/ipo/kzz/  直接返回 JSON（不是 HTML）
 // 实测要点：
 //  1. 必须带 User-Agent，否则返回 "Nginx forbidden."
-//  2. 返回 {status_code:0, status_msg:"ok", list:[{sub_date, bond_code, bond_name, code, name, ...}]}
-//  3. list 是全量历史（约 950 条）且包含未来待申购的债，本地按 sub_date 过滤当天
-async function tonghuashunOnce(today: string, ua: string): Promise<Bond[]> {
-  const url = "https://data.10jqka.com.cn/ipo/kzz/";
-  const json = await fetchJson(url, {
-    "User-Agent": ua,
-    "Referer": "https://data.10jqka.com.cn/ipo/kzz/",
-    "Accept": "application/json, text/plain, */*",
-  });
+//  2. 返回 {status_code:0, status_msg:"ok", list:[{sub_date, listing_date, bond_code, bond_name, ...}]}
+//  3. list 是全量（约 950 条）且包含未来待申购的债，本地按 sub_date / listing_date 过滤当天
+//  4. 未上市的债 listing_date = "0"
+//  5. 申购与上市两类查询共用同一个接口 → 加个短 TTL 缓存 + in-flight 复用，一次 run 只打一次请求
+const THS_DATE_FIELD: Record<QueryKind, string> = {
+  apply: "sub_date",
+  listing: "listing_date",
+};
 
-  if (json?.status_code !== 0) {
-    throw new Error(`接口异常 status_code=${json?.status_code} msg=${json?.status_msg}`);
-  }
-  const list: Record<string, unknown>[] = json?.list ?? [];
-  // 全量列表正常有几百条；为空说明接口被限流或改版，抛错触发重试
-  if (list.length === 0) throw new Error("返回 list 为空（疑似被限流或接口改版）");
+const THS_CACHE_TTL_MS = 60_000;
+let thsCache: Record<string, unknown>[] | null = null;
+let thsCacheAt = 0;
+let thsInflight: Promise<Record<string, unknown>[]> | null = null;
+
+async function thsFetchList(ua: string): Promise<Record<string, unknown>[]> {
+  if (thsCache && Date.now() - thsCacheAt < THS_CACHE_TTL_MS) return thsCache;
+  if (thsInflight) return thsInflight; // 并发的两类查询复用同一次请求
+
+  thsInflight = (async () => {
+    try {
+      const json = await fetchJson("https://data.10jqka.com.cn/ipo/kzz/", {
+        "User-Agent": ua,
+        "Referer": "https://data.10jqka.com.cn/ipo/kzz/",
+        "Accept": "application/json, text/plain, */*",
+      });
+      if (json?.status_code !== 0) {
+        throw new Error(
+          `接口异常 status_code=${json?.status_code} msg=${json?.status_msg}`,
+        );
+      }
+      const list: Record<string, unknown>[] = json?.list ?? [];
+      // 全量列表正常有几百条；为空说明接口被限流或改版，抛错触发重试
+      if (list.length === 0) {
+        throw new Error("返回 list 为空（疑似被限流或接口改版）");
+      }
+      thsCache = list;
+      thsCacheAt = Date.now();
+      return list;
+    } finally {
+      thsInflight = null; // 失败时清空，让重试能重新发起请求
+    }
+  })();
+  return thsInflight;
+}
+
+async function tonghuashunOnce(
+  today: string,
+  ua: string,
+  kind: QueryKind,
+): Promise<Bond[]> {
+  const field = THS_DATE_FIELD[kind];
+  const list = await thsFetchList(ua);
 
   const bonds: Bond[] = [];
   for (const r of list) {
-    const applyDate = String(r.sub_date ?? "").slice(0, 10);
-    if (applyDate !== today) continue;
+    const raw = String(r[field] ?? "").trim();
+    if (!raw || raw === "0") continue; // 未上市的 listing_date 是 "0"
+    if (raw.slice(0, 10) !== today) continue;
     const code = String(r.bond_code ?? "").trim();
     const name = String(r.bond_name ?? "").trim();
-    if (code) bonds.push({ code, name, applyDate });
+    if (code) bonds.push({ code, name, date: raw.slice(0, 10) });
   }
   return bonds;
 }
@@ -178,7 +244,19 @@ async function tonghuashunOnce(today: string, ua: string): Promise<Bond[]> {
 export function fetchTonghuashun(
   today: string,
   ua: string,
+  kind: QueryKind,
   onLog: (msg: string) => void,
 ): Promise<SourceResult> {
-  return withRetry("来源B 同花顺", () => tonghuashunOnce(today, ua), onLog);
+  return withRetry(
+    `来源B 同花顺·${KIND_LABEL[kind]}`,
+    () => tonghuashunOnce(today, ua, kind),
+    onLog,
+  );
+}
+
+/** 仅用于测试：清空同花顺缓存 */
+export function _resetThsCache() {
+  thsCache = null;
+  thsCacheAt = 0;
+  thsInflight = null;
 }

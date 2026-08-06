@@ -1,13 +1,15 @@
 /**
- * 可转债新债申购每日提醒
+ * 可转债「新债申购 + 新债上市」每日提醒
  * ------------------------------------------------------------------
  * 功能：
  *  - 每个工作日（周一至周五）北京时间 09:00 自动运行
  *    （cron 表达式写作 UTC 的 "0 1 * * 2-6"，详见文件末尾调度处的注释）
- *  - 查询两个来源（东方财富、同花顺）当天是否有可转债新债申购
- *  - 每个来源：超时/失败后间隔 1 分钟重试，最多尝试 3 次
- *  - 两来源一致 → 推送一次；不一致 → 两个来源都推送；均无 → 推送“无新债”
- *  - 两来源 3 次尝试后都失败 → 推送“无法查询”告警
+ *  - 查询两个来源（东方财富、同花顺）当天：
+ *      ① 是否有可转债新债【申购】
+ *      ② 是否有可转债新债【上市】
+ *  - 每个查询：超时/失败后间隔 1 分钟重试，最多尝试 3 次
+ *  - 每一类各自交叉验证：两来源一致 → 用合并结果；不一致 → 两个来源都列出待核实
+ *  - 申购与上市的结论合并成【一条】PushDeer 推送，标题一眼看出两类结论
  *  - 推送使用 PushDeer（自建源），并强制使用特定 User-Agent
  *  - 每步打印简单的过程与结果
  *
@@ -20,10 +22,11 @@ import { loadConfig } from "./config.ts";
 import {
   fetchEastmoney,
   fetchTonghuashun,
+  KIND_LABEL,
   MAX_ATTEMPTS,
   todayStr,
 } from "./sources.ts";
-import type { Bond, SourceResult } from "./sources.ts";
+import type { Bond, QueryKind, SourceResult } from "./sources.ts";
 import { normalizePushUrl, pushDeer } from "./pushdeer.ts";
 
 const SOURCE_A = "东方财富";
@@ -38,7 +41,7 @@ const SOURCE_B = "同花顺";
 export const CRON_EXPR = "0 1 * * 2-6";
 export const CRON_DESC = `${CRON_EXPR} (UTC) = 每周一至周五 09:00 北京时间`;
 
-/** 当前北京时间，形如 2026-08-03 17:07:13 */
+/** 当前北京时间，形如 2026-08-06 15:07:13 */
 function beijingNow(): string {
   return new Date().toLocaleString("sv-SE", { timeZone: "Asia/Shanghai" });
 }
@@ -53,15 +56,33 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
   return true;
 }
 
-function formatBonds(bonds: Bond[], label: string): string {
-  if (bonds.length === 0) return `${label}：无`;
-  const lines = bonds.map((b, i) => `${i + 1}. ${b.name}（${b.code}）`);
-  return `${label}（${bonds.length} 只）：\n` + lines.join("\n");
-}
-
-/** 标题里用的短日期，形如 08-05（年份在正文里，标题省下字数给关键信息） */
+/** 标题里用的短日期，形如 08-06（年份在正文里，标题省下字数给关键信息） */
 function shortDate(d: string): string {
   return d.slice(5);
+}
+
+/**
+ * 挑一个更规范的简称。
+ * 上市首日东财会带 N 前缀（「N曙26转」），同花顺是「曙26转债」——优先用不带 N 的完整名。
+ */
+function pickName(a: string, b: string): string {
+  const aN = /^N/.test(a);
+  const bN = /^N/.test(b);
+  if (a && !aN && (!b || bN)) return a;
+  if (b && !bN && (!a || aN)) return b;
+  return a || b;
+}
+
+/** 按代码合并两个来源的债券列表（比对已确认一致时使用），名称取更规范的那个 */
+function mergeBonds(as: Bond[], bs: Bond[]): Bond[] {
+  const byCode = new Map<string, Bond>();
+  for (const x of as) byCode.set(x.code, { ...x });
+  for (const y of bs) {
+    const cur = byCode.get(y.code);
+    if (cur) cur.name = pickName(cur.name, y.name);
+    else byCode.set(y.code, { ...y });
+  }
+  return [...byCode.values()].sort((x, z) => x.code.localeCompare(z.code));
 }
 
 /**
@@ -69,98 +90,200 @@ function shortDate(d: string): string {
  * 不带数量后缀——标题里前面已经写了「N 只」，重复显示会很啰嗦。
  */
 function bondNames(bonds: Bond[], max = 3): string {
-  const names = bonds.map((b) => b.name);
+  const names = bonds.map((b) => b.name).filter(Boolean);
   if (names.length <= max) return names.join("、");
   return names.slice(0, max).join("、") + " 等";
 }
 
-/** 单个来源的简述，用于「来源不一致」时的标题 */
+/** 明细列表，缩进两格挂在「- 来源X」下面，避免正文层级看起来是平的 */
+function formatBonds(bonds: Bond[], label: string): string {
+  if (bonds.length === 0) return `${label}：无`;
+  const lines = bonds.map((b, i) => `    ${i + 1}. ${b.name}（${b.code}）`);
+  return `${label}（${bonds.length} 只）：\n` + lines.join("\n");
+}
+
+/** 单个来源的简述，用于「来源不一致」时展示 */
 function briefOf(r: SourceResult): string {
   if (!r.ok) return "查询失败";
   return r.bonds.length === 0 ? "无" : `${r.bonds.length} 只`;
+}
+
+// ==================== 单类（申购 / 上市）的结论 ====================
+type GroupStatus = "ok" | "mismatch" | "failed";
+
+interface Group {
+  kind: QueryKind;
+  label: string; // 申购 / 上市
+  a: SourceResult;
+  b: SourceResult;
+  status: GroupStatus;
+  bonds: Bond[]; // status=ok 时的合并结果
+}
+
+function judge(kind: QueryKind, a: SourceResult, b: SourceResult): Group {
+  const label = KIND_LABEL[kind];
+  if (!a.ok && !b.ok) {
+    return { kind, label, a, b, status: "failed", bonds: [] };
+  }
+  const consistent = a.ok && b.ok &&
+    setsEqual(
+      new Set(a.bonds.map((x) => x.code)),
+      new Set(b.bonds.map((x) => x.code)),
+    );
+  if (consistent) {
+    return {
+      kind,
+      label,
+      a,
+      b,
+      status: "ok",
+      bonds: mergeBonds(a.bonds, b.bonds),
+    };
+  }
+  return { kind, label, a, b, status: "mismatch", bonds: [] };
+}
+
+/**
+ * 标题里该类别的片段，如「申购 中仑转债」「无上市」「申购待核实 中仑转债」。
+ * maxNames：名字上限。两类都有债时收紧到 2，防止标题被手机通知栏截断。
+ */
+function titlePart(g: Group, maxNames: number): string {
+  if (g.status === "failed") return `${g.label}查询失败`;
+  if (g.status === "mismatch") {
+    // 取两来源并集，让用户至少知道「可能是哪几只」，明细在正文
+    const union = mergeBonds(g.a.bonds, g.b.bonds);
+    return union.length === 0
+      ? `${g.label}待核实`
+      : `${g.label}待核实 ${bondNames(union, maxNames)}`;
+  }
+  if (g.bonds.length === 0) return `无${g.label}`;
+  const count = g.bonds.length === 1 ? "" : `${g.bonds.length}只 `;
+  return `${g.label} ${count}${bondNames(g.bonds, maxNames)}`;
+}
+
+/** 正文里该类别的完整段落 */
+function bodySection(g: Group, today: string): string {
+  const head = `【${g.label}】`;
+  if (g.status === "failed") {
+    return `${head}❗ 两个来源均查询失败（各重试 ${MAX_ATTEMPTS} 次，间隔 60 秒）\n` +
+      `- ${SOURCE_A}：${g.a.error}\n` +
+      `- ${SOURCE_B}：${g.b.error}\n` +
+      `→ 请手动确认今日是否有新债${g.label}。`;
+  }
+  if (g.status === "mismatch") {
+    const aNote = g.a.ok
+      ? formatBonds(g.a.bonds, `- 来源A ${SOURCE_A}`)
+      : `- 来源A ${SOURCE_A}：查询失败（已重试 ${g.a.attempts} 次）- ${g.a.error}`;
+    const bNote = g.b.ok
+      ? formatBonds(g.b.bonds, `- 来源B ${SOURCE_B}`)
+      : `- 来源B ${SOURCE_B}：查询失败（已重试 ${g.b.attempts} 次）- ${g.b.error}`;
+    // 区分两种情况：真的对不上 vs 有一边压根没查成（后者不该说成“不一致”）
+    const reason = (!g.a.ok || !g.b.ok)
+      ? "⚠️ 有来源查询失败，以下结果未经交叉验证，请自行核实："
+      : "⚠️ 两来源结果不一致，需人工核实：";
+    return `${head}${reason}\n${aNote}\n${bNote}`;
+  }
+  if (g.bonds.length === 0) {
+    return `${head}今日（${today}）无可转债新债${g.label}。（两来源一致）`;
+  }
+  return `${head}今日（${today}）共 ${g.bonds.length} 只（两来源一致）：\n` +
+    g.bonds.map((b, i) => `${i + 1}. ${b.name}（${b.code}）`).join("\n");
+}
+
+/** 整体状态 emoji：取两类里最严重的 */
+function overallEmoji(gs: Group[]): string {
+  if (gs.every((g) => g.status === "failed")) return "❗";
+  if (gs.some((g) => g.status !== "ok")) return "⚠️";
+  if (gs.some((g) => g.bonds.length > 0)) return "🔔";
+  return "⭕";
 }
 
 export async function run() {
   const startedAt = Date.now();
   const cfg = loadConfig();
   const today = todayStr();
-  log("1/5", `初始化：北京时间 ${beijingNow()}（UTC ${new Date().toISOString().slice(0, 19).replace("T", " ")}）`);
-  log("1/5", `查询日期（北京时间）= ${today}；重试策略 = 最多 ${MAX_ATTEMPTS} 次、间隔 60 秒`);
+  log(
+    "1/5",
+    `初始化：北京时间 ${beijingNow()}（UTC ${
+      new Date().toISOString().slice(0, 19).replace("T", " ")
+    }）`,
+  );
+  log(
+    "1/5",
+    `查询日期（北京时间）= ${today}；查询内容 = 新债申购 + 新债上市；重试策略 = 最多 ${MAX_ATTEMPTS} 次、间隔 60 秒`,
+  );
   log(
     "1/5",
     `推送配置：接口 = ${normalizePushUrl(cfg.pushdeerUrl)}；pushkey = ${
-      cfg.pushdeerKey ? cfg.pushdeerKey.slice(0, 4) + "***(len " + cfg.pushdeerKey.length + ")" : "未配置"
+      cfg.pushdeerKey
+        ? cfg.pushdeerKey.slice(0, 4) + "***(len " + cfg.pushdeerKey.length +
+          ")"
+        : "未配置"
     }`,
   );
 
-  // 步骤2：并行查询两个来源（各自内部带超时与重试，过程逐条打印）
-  log("2/5", "开始并行查询两个来源…");
-  const [ra, rb]: [SourceResult, SourceResult] = await Promise.all([
-    fetchEastmoney(today, cfg.dataUserAgent, (m) => log("2/5", m)),
-    fetchTonghuashun(today, cfg.dataUserAgent, (m) => log("2/5", m)),
+  // 步骤2：并行查询 2 来源 × 2 类别（同花顺两类共用一次 HTTP 请求，内部有缓存）
+  log("2/5", "开始并行查询：东方财富/同花顺 × 申购/上市…");
+  const ua = cfg.dataUserAgent;
+  const onLog = (m: string) => log("2/5", m);
+  const [aApply, bApply, aList, bList] = await Promise.all([
+    fetchEastmoney(today, ua, "apply", onLog),
+    fetchTonghuashun(today, ua, "apply", onLog),
+    fetchEastmoney(today, ua, "listing", onLog),
+    fetchTonghuashun(today, ua, "listing", onLog),
   ]);
 
   // 步骤3：汇总
-  const descA = ra.ok
-    ? `${ra.bonds.length} 只${ra.bonds.length ? "（" + ra.bonds.map((b) => `${b.name}/${b.code}`).join("、") + "）" : ""}`
-    : `查询失败（尝试 ${ra.attempts} 次）- ${ra.error}`;
-  const descB = rb.ok
-    ? `${rb.bonds.length} 只${rb.bonds.length ? "（" + rb.bonds.map((b) => `${b.name}/${b.code}`).join("、") + "）" : ""}`
-    : `查询失败（尝试 ${rb.attempts} 次）- ${rb.error}`;
-  log("3/5", `汇总：来源A ${SOURCE_A} → ${descA}`);
-  log("3/5", `汇总：来源B ${SOURCE_B} → ${descB}`);
+  const desc = (r: SourceResult) =>
+    r.ok
+      ? `${r.bonds.length} 只${
+        r.bonds.length
+          ? "（" + r.bonds.map((b) => `${b.name}/${b.code}`).join("、") + "）"
+          : ""
+      }`
+      : `查询失败（尝试 ${r.attempts} 次）- ${r.error}`;
+  log("3/5", `汇总·申购：${SOURCE_A} → ${desc(aApply)}`);
+  log("3/5", `汇总·申购：${SOURCE_B} → ${desc(bApply)}`);
+  log("3/5", `汇总·上市：${SOURCE_A} → ${desc(aList)}`);
+  log("3/5", `汇总·上市：${SOURCE_B} → ${desc(bList)}`);
 
-  // 步骤4：比对
-  const codesA = new Set(ra.bonds.map((b) => b.code));
-  const codesB = new Set(rb.bonds.map((b) => b.code));
-  const bothFailed = !ra.ok && !rb.ok;
-  const bothOk = ra.ok && rb.ok;
-  const consistent = bothOk && setsEqual(codesA, codesB);
-
-  let title: string;
-  let content: string;
-
-  if (bothFailed) {
-    // 两来源都失败 → 推送“无法查询”告警
-    log("4/5", `比对：跳过（两来源均在 ${MAX_ATTEMPTS} 次尝试后失败）`);
-    title = `❗ 今日新债查询失败 ${shortDate(today)}｜请手动确认`;
-    content = `今天（${today}）两个数据源均**无法查询**，已各重试 ${MAX_ATTEMPTS} 次（间隔 60 秒）。\n\n` +
-      `- 来源A ${SOURCE_A}：${ra.error}\n` +
-      `- 来源B ${SOURCE_B}：${rb.error}\n\n` +
-      `请手动确认今日是否有新债申购。`;
-  } else if (consistent) {
-    log("4/5", "比对：两来源一致");
-    if (ra.bonds.length === 0) {
-      // 一致且都为 0 → 当天无新债
-      title = `⭕ 今日无新债 ${shortDate(today)}`;
-      content = `今天（${today}）中国市场**无**可转债新债申购申请。\n\n（${SOURCE_A} 与 ${SOURCE_B} 两来源结果一致）`;
-    } else {
-      // 一致且有债 → 推送一次
-      title = `🔔 今日有新债 ${ra.bonds.length} 只｜${bondNames(ra.bonds)}（${shortDate(today)}）`;
-      content = `今天（${today}）有可转债新债申购，两来源一致：\n\n` +
-        formatBonds(ra.bonds, "新债") +
-        `\n\n（来源：${SOURCE_A} / ${SOURCE_B}）`;
-    }
-  } else {
-    // 不一致（含其中一个来源查询失败）→ 两个来源都推送
-    log("4/5", `比对：两来源不一致（A=${ra.ok ? ra.bonds.length + " 只" : "失败"}, B=${rb.ok ? rb.bonds.length + " 只" : "失败"}）`);
-    const aNote = ra.ok
-      ? formatBonds(ra.bonds, `来源A ${SOURCE_A}`)
-      : `来源A ${SOURCE_A}：查询失败（已重试 ${ra.attempts} 次）- ${ra.error}`;
-    const bNote = rb.ok
-      ? formatBonds(rb.bonds, `来源B ${SOURCE_B}`)
-      : `来源B ${SOURCE_B}：查询失败（已重试 ${rb.attempts} 次）- ${rb.error}`;
-    // 只要任一来源查到债，标题就按「可能有新债」提示，避免漏掉申购机会
-    const anyBond = ra.bonds.length > 0 || rb.bonds.length > 0;
-    title = `⚠️ 今日${anyBond ? "疑似有新债" : "疑似无新债"}·待核实 ${shortDate(today)}｜` +
-      `${SOURCE_A} ${briefOf(ra)} / ${SOURCE_B} ${briefOf(rb)}`;
-    content = `今天（${today}）两来源结果不一致，分别列出：\n\n${aNote}\n\n${bNote}`;
+  // 步骤4：各类别独立比对
+  const groups: Group[] = [
+    judge("apply", aApply, bApply),
+    judge("listing", aList, bList),
+  ];
+  for (const g of groups) {
+    const verdict = g.status === "ok"
+      ? `两来源一致 → ${g.bonds.length} 只`
+      : g.status === "failed"
+      ? `两来源均失败（各 ${MAX_ATTEMPTS} 次）`
+      : `两来源不一致（${SOURCE_A} ${briefOf(g.a)} / ${SOURCE_B} ${
+        briefOf(g.b)
+      }）`;
+    log("4/5", `比对·${g.label}：${verdict}`);
   }
 
-  // 步骤5：推送
+  // 拼标题：emoji + 日期 + 申购结论｜上市结论
+  // 两类都有债时把名字上限收紧到 2，避免标题过长在通知栏被截断
+  const bothHaveBonds = groups.filter((g) => g.bonds.length > 0).length === 2;
+  const maxNames = bothHaveBonds ? 2 : 3;
+  const title = `${overallEmoji(groups)} ${shortDate(today)} ` +
+    groups.map((g) => titlePart(g, maxNames)).join("｜");
+
+  // 拼正文
+  const content = `📅 ${today}（北京时间 ${beijingNow()}）\n\n` +
+    groups.map((g) => bodySection(g, today)).join("\n\n") +
+    `\n\n---\n数据来源：${SOURCE_A} / ${SOURCE_B}（交叉验证）`;
+
+  log("4/5", `推送标题：${title}`);
+
+  // 步骤5：推送（申购 + 上市 合并为一条）
   if (!cfg.pushdeerKey) {
     log("5/5", `未配置 PUSHDEER_KEY，仅打印不推送。\n标题：${title}\n${content}`);
-    log("5/5", `全流程结束，总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+    log(
+      "5/5",
+      `全流程结束，总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+    );
     return;
   }
   try {
@@ -173,14 +296,17 @@ export async function run() {
   } catch (e) {
     log("5/5", `推送 PushDeer 异常：${(e as Error).message}`);
   }
-  log("5/5", `全流程结束，总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+  log(
+    "5/5",
+    `全流程结束，总耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+  );
 }
 
 // ---- 调度 ----
 // 部署到 Deno Deploy 时注册 cron；本地直接运行一次
 const isDeployed = !!Deno.env.get("DENO_DEPLOYMENT_ID");
 if (isDeployed) {
-  // ⚠️ Deno.cron 的两个官方约定，踩过坑记下来：
+  // ⚠️ Deno.cron 的几个官方约定，踩过坑记下来：
   //  1) 任务名只允许「字母、数字、空格、连字符、下划线」，不能用中文。
   //  2) schedule 只能用 UTC，options 里【没有】timezone 选项（只有 backoffSchedule / signal），
   //     写了会被静默忽略。所以北京时间 09:00 必须自己换算成 UTC 01:00（UTC+8）。
@@ -229,8 +355,9 @@ if (isDeployed) {
     }
     return new Response(
       "kezhai-reminder is running.\n" +
-        `cron  : ${CRON_DESC}\n` +
-        `now   : 北京时间 ${beijingNow()}\n` +
+        `cron   : ${CRON_DESC}\n` +
+        `now    : 北京时间 ${beijingNow()}\n` +
+        "checks : 新债申购 + 新债上市\n" +
         "sources: eastmoney + 10jqka\n" +
         "manual trigger  : GET /run        (完整流程，结果看 Logs)\n" +
         "pushdeer test   : GET /push-test  (只测推送，结果直接返回)\n",
@@ -238,7 +365,9 @@ if (isDeployed) {
     );
   });
 
-  console.log(`已注册 cron：cb-new-bond-reminder，${CRON_DESC}。当前北京时间 ${beijingNow()}。访问 /run 可手动触发一次。`);
+  console.log(
+    `已注册 cron：cb-new-bond-reminder，${CRON_DESC}。当前北京时间 ${beijingNow()}。访问 /run 可手动触发一次。`,
+  );
 } else {
   await run();
 }
